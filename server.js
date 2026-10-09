@@ -19,6 +19,7 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import businessReviewRoutes from "./routes/businessReviewRoutes.js";
 import reviewRoutes from "./routes/reviewRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import savedPlaceRoutes from "./routes/savedPlaceRoutes.js";
 
 const app = express();
 dotenv.config();
@@ -68,6 +69,7 @@ app.use("/api/v1/analytics", analyticsRoutes);
 app.use("/api/v1/business/reviews", businessReviewRoutes);
 app.use("/api/v1/reviews", reviewRoutes);
 app.use("/api/v1/admin", adminRoutes);
+app.use("/api/v1/saved-places", savedPlaceRoutes);
 
 
 // ─── Error handling ──────────────────────────────────────────────

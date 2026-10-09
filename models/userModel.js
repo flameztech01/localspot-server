@@ -52,6 +52,14 @@ const userSchema = new mongoose.Schema(
       select: false,
     },
 
+    // ── Saved places (businesses this user has bookmarked) ───
+    savedPlaces: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
+
     // ── Business kind (high-level classification) ────────────
     businessKind: {
       type: String,
