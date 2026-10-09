@@ -20,7 +20,7 @@ const VALID_BUSINESS_KINDS = [
 // Public-safe projection for listing endpoints (no PII, no secrets)
 const PUBLIC_BUSINESS_PROJECTION =
   "businessName description businessKind businessKindOther businessType " +
-  "categorySlug tags coverImage images location openingHours priceRange " +
+  "categorySlug tags logo coverImage images location openingHours priceRange " +
   "rating numReviews viewCount isFeatured featuredUntil featuredPlan " +
   "isPopular isVerified businessVerified createdAt";
 
@@ -356,6 +356,21 @@ const getCurrentBusinessAccount = asyncHandler(async (req, res) => {
 // @desc    Update the logged-in business's public profile
 // @route   PUT /api/v1/auth/business/profile
 // @access  Private
+//
+// Multipart fields accepted:
+//   Text:
+//     businessName, description, businessType, website, phone,
+//     address, priceRange, businessKind, businessKindOther,
+//     tags          (JSON array)
+//     location      (JSON object)
+//     openingHours  (JSON array)
+//     removeImages  (JSON array of URLs to drop from `images`)
+//     removeCover   ("true" to clear coverImage)
+//     removeLogo    ("true" to clear logo)
+//   Files:
+//     images      (multiple, min 10 max 20 total)
+//     coverImage  (single, hero banner)
+//     logo        (single, profile picture / avatar)
 // ──────────────────────────────────────────────────────────────
 const updateBusinessProfile = asyncHandler(async (req, res) => {
   if (!req.user.isVerified) {
@@ -493,7 +508,29 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
     }
   }
 
-  // ── Images ───────────────────────────────────────────────
+  // ── Logo (profile picture) ───────────────────────────────
+  const wantsRemoveLogo =
+    req.body.removeLogo === "true" || req.body.removeLogo === true;
+
+  if (wantsRemoveLogo && !req.files?.logo?.[0]) {
+    user.logo = undefined;
+  }
+  if (req.files?.logo?.[0]?.path) {
+    user.logo = req.files.logo[0].path;
+  }
+
+  // ── Cover banner ─────────────────────────────────────────
+  const wantsRemoveCover =
+    req.body.removeCover === "true" || req.body.removeCover === true;
+
+  if (wantsRemoveCover && !req.files?.coverImage?.[0]) {
+    user.coverImage = undefined;
+  }
+  if (req.files?.coverImage?.[0]?.path) {
+    user.coverImage = req.files.coverImage[0].path;
+  }
+
+  // ── Gallery images ───────────────────────────────────────
   let currentImages = Array.isArray(user.images) ? [...user.images] : [];
 
   let removedCount = 0;
@@ -549,10 +586,6 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
   }
 
   user.images = currentImages;
-
-  if (req.files?.coverImage?.[0]?.path) {
-    user.coverImage = req.files.coverImage[0].path;
-  }
 
   await user.save();
 
@@ -672,11 +705,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
   );
   const skip = (page - 1) * limit;
 
-  // Only ever show businesses that are:
-  //   - role: business
-  //   - email verified
-  //   - admin approved
-  //   - currently active
   const filter = {
     role: "business",
     isActive: true,
@@ -686,7 +714,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
 
   const andClauses = [];
 
-  // Business kind: hotels | dining | things_to_do | shops | others
   if (req.query.kind) {
     const k = String(req.query.kind).trim().toLowerCase();
     if (VALID_BUSINESS_KINDS.includes(k)) {
@@ -694,26 +721,22 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     }
   }
 
-  // Category slug
   if (req.query.category) {
     filter.categorySlug = String(req.query.category).trim().toLowerCase();
   }
 
-  // City
   if (req.query.city) {
     filter["location.city"] = {
       $regex: new RegExp(`^${req.query.city.trim()}$`, "i"),
     };
   }
 
-  // Country
   if (req.query.country) {
     filter["location.country"] = {
       $regex: new RegExp(`^${req.query.country.trim()}$`, "i"),
     };
   }
 
-  // Minimum rating
   if (req.query.minRating) {
     const r = Number(req.query.minRating);
     if (!Number.isNaN(r) && r >= 0 && r <= 5) {
@@ -721,7 +744,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     }
   }
 
-  // Featured only (respects expiry)
   if (req.query.featured === "true" || req.query.featured === true) {
     filter.isFeatured = true;
     andClauses.push({
@@ -733,7 +755,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     });
   }
 
-  // Optional text search
   if (req.query.q) {
     const q = String(req.query.q).trim();
     andClauses.push({
@@ -748,7 +769,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     filter.$and = andClauses;
   }
 
-  // Sort
   const SORTS = {
     rating: { rating: -1, numReviews: -1 },
     newest: { createdAt: -1 },

@@ -1,3 +1,4 @@
+// src/routes/businessRoutes.js
 import express from "express";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
@@ -29,7 +30,7 @@ import { protect } from "../middleware/authMiddleware.js";
 const router = express.Router();
 
 // ──────────────────────────────────────────────────────────────
-// Cloudinary
+// Cloudinary config
 // ──────────────────────────────────────────────────────────────
 cloudinary.config({
   cloud_name: process.env.CLOUD_NAME,
@@ -37,24 +38,54 @@ cloudinary.config({
   api_secret: process.env.API_SECRET,
 });
 
+// Per-field storage: logo gets square crop, coverImage gets 16:6,
+// images get a general 4:3 limited crop.
 const storage = new CloudinaryStorage({
   cloudinary,
-  params: {
-    folder: "BusinessProfiles",
-    allowed_formats: ["jpg", "png", "jpeg", "webp"],
-    transformation: [{ width: 1600, height: 1200, crop: "limit" }],
+  params: (req, file) => {
+    const base = {
+      folder: "BusinessProfiles",
+      allowed_formats: ["jpg", "png", "jpeg", "webp"],
+      resource_type: "image",
+    };
+
+    if (file.fieldname === "logo") {
+      return {
+        ...base,
+        // Square avatar, cropped tightly
+        transformation: [
+          { width: 600, height: 600, crop: "fill", gravity: "auto" },
+        ],
+      };
+    }
+
+    if (file.fieldname === "coverImage") {
+      return {
+        ...base,
+        // Wide hero banner
+        transformation: [
+          { width: 1600, height: 600, crop: "fill", gravity: "auto" },
+        ],
+      };
+    }
+
+    // Default for gallery images
+    return {
+      ...base,
+      transformation: [{ width: 1600, height: 1200, crop: "limit" }],
+    };
   },
 });
 
 const upload = multer({
   storage,
   limits: {
-    fileSize: 8 * 1024 * 1024,
-    files: 21,
+    fileSize: 8 * 1024 * 1024, // 8 MB per file
+    files: 22, // 20 gallery + 1 cover + 1 logo
   },
 });
 
-// Inline admin gate
+// Inline admin gate (assumes `protect` ran first and set req.user)
 const isAdmin = (req, res, next) => {
   if (req.user?.role !== "admin") {
     res.status(403);
@@ -89,8 +120,9 @@ router.put(
   "/profile",
   protect,
   upload.fields([
-    { name: "images", maxCount: 20 },
+    { name: "logo", maxCount: 1 },
     { name: "coverImage", maxCount: 1 },
+    { name: "images", maxCount: 20 },
   ]),
   updateBusinessProfile
 );

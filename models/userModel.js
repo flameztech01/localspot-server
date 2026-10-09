@@ -1,3 +1,4 @@
+// src/models/userModel.js
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 
@@ -67,7 +68,13 @@ const userSchema = new mongoose.Schema(
     // ── Business profile ─────────────────────────────────────
     businessType: {
       type: String,
-      enum: ["sole_proprietorship", "partnership", "llc", "corporation", "other"],
+      enum: [
+        "sole_proprietorship",
+        "partnership",
+        "llc",
+        "corporation",
+        "other",
+      ],
       default: "other",
     },
     description: { type: String, trim: true },
@@ -79,6 +86,10 @@ const userSchema = new mongoose.Schema(
     tags: [{ type: String, trim: true }],
 
     // ── Images ───────────────────────────────────────────────
+    // logo        → square profile picture / avatar
+    // coverImage  → landscape hero banner
+    // images      → gallery photos (10–20)
+    logo: { type: String, trim: true },
     coverImage: { type: String, trim: true },
     images: {
       type: [{ type: String, trim: true }],
