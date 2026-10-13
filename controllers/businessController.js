@@ -1,11 +1,18 @@
+// src/controllers/businessController.js
 import asyncHandler from "express-async-handler";
-import mongoose from "mongoose";
 import User from "../models/userModel.js";
-import generateToken from "../utils/generateToken.js";
-import { generateOTP } from "../utils/generateOTP.js";
-import { sendOTPEmail } from "../utils/resendOTP.js";
+import ActivityLog from "../models/activityLogModel.js";
+import { logActivity } from "../utils/logActivity.js";
+import {
+  sendApplicationSubmitted,
+  sendApplicationApproved,
+  sendApplicationRejected,
+  sendKYCSubmitted,
+  sendKYCApproved,
+  sendKYCRejected,
+  sendBusinessFeatured,
+} from "../utils/resendMail.js";
 
-const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const MIN_BUSINESS_IMAGES = 10;
 const MAX_BUSINESS_IMAGES = 20;
 
@@ -17,38 +24,39 @@ const VALID_BUSINESS_KINDS = [
   "others",
 ];
 
-// Public-safe projection for listing endpoints (no PII, no secrets)
+const VALID_REPRESENTATIVE_TYPES = ["owner", "director", "agent"];
+const VALID_ID_TYPES = ["nin", "passport", "drivers_license", "voters_card"];
+const VALID_REGISTRATION_TYPES = ["llc", "bn", "partnership", "corp"];
+
+// ──────────────────────────────────────────────────────────────
+// Projections
+// ──────────────────────────────────────────────────────────────
 const PUBLIC_BUSINESS_PROJECTION =
   "businessName description businessKind businessKindOther businessType " +
   "categorySlug tags logo coverImage images location openingHours priceRange " +
   "rating numReviews viewCount isFeatured featuredUntil featuredPlan " +
-  "isPopular isVerified businessVerified createdAt";
+  "isPopular isVerified businessVerified kycStatus createdAt";
 
-// Public-safe projection for a single business (adds contact fields)
 const PUBLIC_BUSINESS_DETAIL_PROJECTION =
   PUBLIC_BUSINESS_PROJECTION + " phone website email";
 
 // ──────────────────────────────────────────────────────────────
-// Serializer — sends EVERYTHING the frontend could possibly need.
-// Excludes only secrets (password, otp, otpExpire, otpPurpose).
+// Serializer
 // ──────────────────────────────────────────────────────────────
 const publicUser = (user) => {
   if (!user) return null;
   const u = user.toObject ? user.toObject() : { ...user };
 
-  // Strip secrets defensively (in case a caller forgot .select)
   delete u.password;
   delete u.otp;
   delete u.otpExpire;
   delete u.otpPurpose;
   delete u.__v;
 
-  // Ensure arrays always come out as arrays, not undefined
   if (!Array.isArray(u.images)) u.images = [];
   if (!Array.isArray(u.tags)) u.tags = [];
   if (!Array.isArray(u.openingHours)) u.openingHours = [];
 
-  // Normalise location so the frontend never has to null-check
   u.location = {
     address: u.location?.address || "",
     city: u.location?.city || "",
@@ -60,15 +68,11 @@ const publicUser = (user) => {
     },
   };
 
-  // Derived flags the frontend UI can rely on without computing
   u.isEmailVerified = !!u.isVerified;
   u.isBusinessApproved = !!u.businessVerified;
-  u.isPendingApproval =
-    !!u.isVerified && !u.businessVerified && !u.businessRejectionReason;
-  u.isRejected =
-    !!u.isVerified && !u.businessVerified && !!u.businessRejectionReason;
+  u.businessApplicationStatus = u.businessApplicationStatus || "none";
+  u.kycStatus = u.kycStatus || "none";
 
-  // Featured status — computed so "expired" featured items stop showing as featured
   const now = Date.now();
   u.isFeaturedActive =
     !!u.isFeatured &&
@@ -82,309 +86,32 @@ const publicUser = (user) => {
 };
 
 // ──────────────────────────────────────────────────────────────
-// @desc    Register a new business account (sends verification OTP)
-// @route   POST /api/v1/auth/business/register
-// @access  Public
+// Helpers
 // ──────────────────────────────────────────────────────────────
-const registerBusinessAccount = asyncHandler(async (req, res) => {
-  const { businessName, email, password, phone, businessType, address } =
-    req.body;
+const toDateOrUndefined = (value) => {
+  if (!value) return undefined;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+};
 
-  if (!businessName || !email || !password) {
-    res.status(400);
-    throw new Error("Business name, email and password are required");
+const parseJSONMaybe = (value) => {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
   }
+};
 
-  if (password.length < 8) {
-    res.status(400);
-    throw new Error("Password must be at least 8 characters");
-  }
-
-  const existing = await User.findOne({ email: email.toLowerCase() });
-
-  if (existing && existing.isVerified) {
-    res.status(409);
-    throw new Error("An account with this email already exists");
-  }
-
-  let user;
-  if (existing) {
-    existing.businessName = businessName;
-    existing.password = password;
-    existing.phone = phone;
-    existing.businessType = businessType;
-    existing.address = address;
-    user = existing;
-  } else {
-    user = new User({
-      businessName,
-      email,
-      password,
-      phone,
-      businessType,
-      address,
-      role: "business",
-    });
-  }
-
-  const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpire = Date.now() + OTP_TTL_MS;
-  user.otpPurpose = "verification";
-  await user.save();
-
-  await sendOTPEmail({ to: user.email, otp, purpose: "verification" });
-
-  res.status(201).json({
-    success: true,
-    message:
-      "Verification code sent to your email. Please verify to continue.",
-    data: { email: user.email },
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Verify business account with OTP (auto-logs in on success)
-// @route   POST /api/v1/auth/business/verify-otp
-// @access  Public
-// ──────────────────────────────────────────────────────────────
-const verifyBusinessAccount = asyncHandler(async (req, res) => {
-  const { email, otp } = req.body;
-
-  if (!email || !otp) {
-    res.status(400);
-    throw new Error("Email and OTP are required");
-  }
-
-  const user = await User.findOne({ email: email.toLowerCase() }).select(
-    "+otp +otpExpire +otpPurpose"
+// Fire-and-forget mail — never blocks the response
+const fireMail = (promise) => {
+  Promise.resolve(promise).catch((err) =>
+    console.error("[mail]", err?.message || err),
   );
+};
 
-  if (!user) {
-    res.status(404);
-    throw new Error("Account not found");
-  }
-
-  if (user.isVerified) {
-    const token = generateToken(res, user._id);
-    return res.status(200).json({
-      success: true,
-      message: user.businessVerified
-        ? "Account already verified"
-        : "Email already verified. Awaiting admin approval.",
-      data: publicUser(user),
-      token,
-    });
-  }
-
-  if (!user.otp || !user.otpExpire || user.otpPurpose !== "verification") {
-    res.status(400);
-    throw new Error("No verification code found. Please request a new one.");
-  }
-
-  if (user.otpExpire < Date.now()) {
-    res.status(400);
-    throw new Error(
-      "Verification code has expired. Please request a new one."
-    );
-  }
-
-  if (user.otp !== otp.toString()) {
-    res.status(400);
-    throw new Error("Invalid verification code");
-  }
-
-  user.isVerified = true;
-  user.otp = undefined;
-  user.otpExpire = undefined;
-  user.otpPurpose = undefined;
-  await user.save();
-
-  const token = generateToken(res, user._id);
-
-  res.status(200).json({
-    success: true,
-    message:
-      "Email verified successfully. Your business account is pending admin approval.",
-    data: publicUser(user),
-    token,
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Resend OTP (verification or password-reset)
-// @route   POST /api/v1/auth/business/resend-otp
-// @access  Public
-// ──────────────────────────────────────────────────────────────
-const resendBusinessOTP = asyncHandler(async (req, res) => {
-  const { email, purpose = "verification" } = req.body;
-
-  if (!email) {
-    res.status(400);
-    throw new Error("Email is required");
-  }
-
-  if (!["verification", "password-reset"].includes(purpose)) {
-    res.status(400);
-    throw new Error("Invalid OTP purpose");
-  }
-
-  const user = await User.findOne({ email: email.toLowerCase() });
-
-  if (!user) {
-    return res.status(200).json({
-      success: true,
-      message: "If that email exists, a new code has been sent",
-    });
-  }
-
-  if (purpose === "verification" && user.isVerified) {
-    res.status(400);
-    throw new Error("Account is already verified");
-  }
-
-  const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpire = Date.now() + OTP_TTL_MS;
-  user.otpPurpose = purpose;
-  await user.save({ validateBeforeSave: false });
-
-  await sendOTPEmail({ to: user.email, otp, purpose });
-
-  res.status(200).json({
-    success: true,
-    message: "If that email exists, a new code has been sent",
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Authenticate a business account
-// @route   POST /api/v1/auth/business/login
-// @access  Public
-// ──────────────────────────────────────────────────────────────
-const loginBusinessAccount = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    res.status(400);
-    throw new Error("Email and password are required");
-  }
-
-  const user = await User.findOne({ email: email.toLowerCase() }).select(
-    "+password"
-  );
-  if (!user) {
-    res.status(401);
-    throw new Error("Invalid credentials");
-  }
-
-  if (!user.isActive) {
-    res.status(403);
-    throw new Error("This account has been deactivated");
-  }
-
-  const isMatch = await user.matchPassword(password);
-  if (!isMatch) {
-    res.status(401);
-    throw new Error("Invalid credentials");
-  }
-
-  if (!user.isVerified) {
-    const otp = generateOTP();
-    user.otp = otp;
-    user.otpExpire = Date.now() + OTP_TTL_MS;
-    user.otpPurpose = "verification";
-    await user.save({ validateBeforeSave: false });
-
-    await sendOTPEmail({ to: user.email, otp, purpose: "verification" });
-
-    res.status(403);
-    throw new Error(
-      "Account not verified. A new verification code has been sent to your email."
-    );
-  }
-
-  const token = generateToken(res, user._id);
-
-  res.status(200).json({
-    success: true,
-    message: user.businessVerified
-      ? "Logged in successfully"
-      : "Logged in. Your business account is pending admin approval.",
-    data: publicUser(user),
-    token,
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Logout
-// @route   POST /api/v1/auth/business/logout
-// @access  Private
-// ──────────────────────────────────────────────────────────────
-const logoutBusinessAccount = asyncHandler(async (req, res) => {
-  res.cookie("jwt", "", {
-    httpOnly: true,
-    expires: new Date(0),
-  });
-
-  res.status(200).json({
-    success: true,
-    message: "Logged out successfully",
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Get the currently authenticated account (everything)
-// @route   GET /api/v1/auth/business/me
-// @access  Private
-// ──────────────────────────────────────────────────────────────
-const getCurrentBusinessAccount = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
-
-  if (!user) {
-    res.status(404);
-    throw new Error("Account not found");
-  }
-
-  res.status(200).json({
-    success: true,
-    data: publicUser(user),
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Update the logged-in business's public profile
-// @route   PUT /api/v1/auth/business/profile
-// @access  Private
-//
-// Multipart fields accepted:
-//   Text:
-//     businessName, description, businessType, website, phone,
-//     address, priceRange, businessKind, businessKindOther,
-//     tags          (JSON array)
-//     location      (JSON object)
-//     openingHours  (JSON array)
-//     removeImages  (JSON array of URLs to drop from `images`)
-//     removeCover   ("true" to clear coverImage)
-//     removeLogo    ("true" to clear logo)
-//   Files:
-//     images      (multiple, min 10 max 20 total)
-//     coverImage  (single, hero banner)
-//     logo        (single, profile picture / avatar)
-// ──────────────────────────────────────────────────────────────
-const updateBusinessProfile = asyncHandler(async (req, res) => {
-  if (!req.user.isVerified) {
-    res.status(403);
-    throw new Error("Verify your email before updating your business profile");
-  }
-
-  const user = await User.findById(req.user._id);
-  if (!user) {
-    res.status(404);
-    throw new Error("Account not found");
-  }
-
-  // ── Simple string fields ─────────────────────────────────
+const applyBusinessProfileFields = (user, body) => {
   const stringFields = [
     "businessName",
     "description",
@@ -392,110 +119,53 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
     "website",
     "phone",
     "address",
+    "cacNumber",
   ];
-  stringFields.forEach((field) => {
-    if (req.body[field] !== undefined) user[field] = req.body[field];
+  stringFields.forEach((f) => {
+    if (body[f] !== undefined) user[f] = body[f];
   });
 
-  // ── Business kind ────────────────────────────────────────
-  if (req.body.businessKind !== undefined) {
-    const kind = String(req.body.businessKind).trim().toLowerCase();
-
-    if (!VALID_BUSINESS_KINDS.includes(kind)) {
-      res.status(400);
-      throw new Error(
-        `businessKind must be one of: ${VALID_BUSINESS_KINDS.join(", ")}`
-      );
-    }
-
-    user.businessKind = kind;
-
-    if (kind === "others") {
-      const other =
-        typeof req.body.businessKindOther === "string"
-          ? req.body.businessKindOther.trim()
-          : "";
-
-      if (!other) {
-        res.status(400);
-        throw new Error(
-          'businessKindOther is required when businessKind is "others"'
-        );
+  if (body.businessKind !== undefined) {
+    const kind = String(body.businessKind).trim().toLowerCase();
+    if (VALID_BUSINESS_KINDS.includes(kind)) {
+      user.businessKind = kind;
+      if (kind === "others") {
+        const other = (body.businessKindOther || "").trim();
+        user.businessKindOther = other ? other.slice(0, 100) : undefined;
+      } else {
+        user.businessKindOther = undefined;
       }
-      if (other.length > 100) {
-        res.status(400);
-        throw new Error("businessKindOther must be 100 characters or fewer");
-      }
-
-      user.businessKindOther = other;
-    } else {
-      user.businessKindOther = undefined;
     }
-  } else if (
-    req.body.businessKindOther !== undefined &&
-    user.businessKind === "others"
-  ) {
-    const other = String(req.body.businessKindOther).trim();
-    if (!other) {
-      res.status(400);
-      throw new Error("businessKindOther cannot be empty");
-    }
-    if (other.length > 100) {
-      res.status(400);
-      throw new Error("businessKindOther must be 100 characters or fewer");
-    }
-    user.businessKindOther = other;
   }
 
-  // ── priceRange ───────────────────────────────────────────
-  if (req.body.priceRange !== undefined) {
-    const pr = Number(req.body.priceRange);
+  if (body.priceRange !== undefined) {
+    const pr = Number(body.priceRange);
     if ([1, 2, 3, 4].includes(pr)) user.priceRange = pr;
   }
 
-  // ── tags ─────────────────────────────────────────────────
-  if (req.body.tags !== undefined) {
-    let tags = req.body.tags;
+  if (body.tags !== undefined) {
+    let tags = parseJSONMaybe(body.tags);
     if (typeof tags === "string") {
-      try {
-        tags = JSON.parse(tags);
-      } catch {
-        tags = tags.split(",").map((t) => t.trim()).filter(Boolean);
-      }
+      tags = tags
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
     }
     if (Array.isArray(tags)) {
       user.tags = tags.map((t) => String(t).trim()).filter(Boolean);
     }
   }
 
-  // ── location ─────────────────────────────────────────────
-  if (req.body.location !== undefined) {
-    let loc = req.body.location;
-    if (typeof loc === "string") {
-      try {
-        loc = JSON.parse(loc);
-      } catch {
-        res.status(400);
-        throw new Error("Invalid `location` JSON");
-      }
-    }
+  if (body.location !== undefined) {
+    const loc = parseJSONMaybe(body.location);
     if (loc && typeof loc === "object") {
       const existing = user.location?.toObject?.() || user.location || {};
       user.location = { ...existing, ...loc };
     }
   }
 
-  // ── openingHours ─────────────────────────────────────────
-  if (req.body.openingHours !== undefined) {
-    let hours = req.body.openingHours;
-    if (typeof hours === "string") {
-      try {
-        hours = JSON.parse(hours);
-      } catch {
-        res.status(400);
-        throw new Error("Invalid `openingHours` JSON");
-      }
-    }
+  if (body.openingHours !== undefined) {
+    const hours = parseJSONMaybe(body.openingHours);
     if (Array.isArray(hours)) {
       user.openingHours = hours
         .filter((h) => h && typeof h.day === "number")
@@ -507,42 +177,216 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
         }));
     }
   }
+};
 
-  // ── Logo (profile picture) ───────────────────────────────
-  const wantsRemoveLogo =
-    req.body.removeLogo === "true" || req.body.removeLogo === true;
-
-  if (wantsRemoveLogo && !req.files?.logo?.[0]) {
-    user.logo = undefined;
+const applyKYCFields = (user, body) => {
+  if (body.representativeType !== undefined) {
+    const v = String(body.representativeType);
+    if (VALID_REPRESENTATIVE_TYPES.includes(v)) user.representativeType = v;
   }
-  if (req.files?.logo?.[0]?.path) {
-    user.logo = req.files.logo[0].path;
+  if (body.ownerLegalName !== undefined)
+    user.ownerLegalName = String(body.ownerLegalName).trim();
+  const dob = toDateOrUndefined(body.ownerDob);
+  if (dob) user.ownerDob = dob;
+
+  if (body.idType !== undefined) {
+    const v = String(body.idType);
+    if (VALID_ID_TYPES.includes(v)) user.idType = v;
+  }
+  if (body.idNumber !== undefined)
+    user.idNumber = String(body.idNumber).trim();
+
+  if (body.registeredBusinessName !== undefined)
+    user.registeredBusinessName = String(body.registeredBusinessName).trim();
+  if (body.registrationType !== undefined) {
+    const v = String(body.registrationType);
+    if (VALID_REGISTRATION_TYPES.includes(v)) user.registrationType = v;
+  }
+  if (body.cacNumber !== undefined)
+    user.cacNumber = String(body.cacNumber).trim();
+  if (body.cacStatus !== undefined)
+    user.cacStatus = String(body.cacStatus).trim();
+
+  if (body.operatingAddress !== undefined)
+    user.operatingAddress = String(body.operatingAddress).trim();
+
+  if (body.riskCategory !== undefined)
+    user.riskCategory = String(body.riskCategory).trim();
+  if (body.foodLicenceNumber !== undefined)
+    user.foodLicenceNumber = String(body.foodLicenceNumber).trim();
+  const foodExpiry = toDateOrUndefined(body.foodLicenceExpiry);
+  if (foodExpiry) user.foodLicenceExpiry = foodExpiry;
+  if (body.liquorLicenceNumber !== undefined)
+    user.liquorLicenceNumber = String(body.liquorLicenceNumber).trim();
+};
+
+// ══════════════════════════════════════════════════════════════
+// USER-SIDE — business APPLICATION
+// ══════════════════════════════════════════════════════════════
+
+const submitBusinessApplication = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
   }
 
-  // ── Cover banner ─────────────────────────────────────────
-  const wantsRemoveCover =
-    req.body.removeCover === "true" || req.body.removeCover === true;
-
-  if (wantsRemoveCover && !req.files?.coverImage?.[0]) {
-    user.coverImage = undefined;
-  }
-  if (req.files?.coverImage?.[0]?.path) {
-    user.coverImage = req.files.coverImage[0].path;
+  if (!user.isVerified) {
+    res.status(403);
+    throw new Error("Verify your email before applying to become a business");
   }
 
-  // ── Gallery images ───────────────────────────────────────
-  let currentImages = Array.isArray(user.images) ? [...user.images] : [];
+  if (user.role === "business" && user.businessVerified) {
+    res.status(400);
+    throw new Error("You already have an approved business account");
+  }
 
-  let removedCount = 0;
-  if (req.body.removeImages !== undefined) {
-    let toRemove = req.body.removeImages;
-    if (typeof toRemove === "string") {
-      try {
-        toRemove = JSON.parse(toRemove);
-      } catch {
-        toRemove = [toRemove];
-      }
+  if (user.businessApplicationStatus === "pending") {
+    res.status(400);
+    throw new Error(
+      "You already have a pending application. Update it instead of resubmitting."
+    );
+  }
+
+  const {
+    businessName,
+    businessType,
+    businessKind,
+    address,
+    cacNumber,
+  } = req.body;
+
+  if (!businessName || !businessType || !businessKind || !address || !cacNumber) {
+    res.status(400);
+    throw new Error(
+      "businessName, businessType, businessKind, address and cacNumber are required"
+    );
+  }
+
+  const kind = String(businessKind).trim().toLowerCase();
+  if (!VALID_BUSINESS_KINDS.includes(kind)) {
+    res.status(400);
+    throw new Error(
+      `businessKind must be one of: ${VALID_BUSINESS_KINDS.join(", ")}`
+    );
+  }
+  if (kind === "others") {
+    const other = (req.body.businessKindOther || "").trim();
+    if (!other) {
+      res.status(400);
+      throw new Error(
+        'businessKindOther is required when businessKind is "others"'
+      );
     }
+  }
+
+  const uploadedImages = (req.files?.images || []).map((f) => f.path);
+  if (uploadedImages.length < MIN_BUSINESS_IMAGES) {
+    res.status(400);
+    throw new Error(
+      `At least ${MIN_BUSINESS_IMAGES} business images are required (got ${uploadedImages.length})`
+    );
+  }
+  if (uploadedImages.length > MAX_BUSINESS_IMAGES) {
+    res.status(400);
+    throw new Error(
+      `At most ${MAX_BUSINESS_IMAGES} business images are allowed`
+    );
+  }
+
+  applyBusinessProfileFields(user, req.body);
+
+  if (req.files?.logo?.[0]?.path) user.logo = req.files.logo[0].path;
+  if (req.files?.coverImage?.[0]?.path)
+    user.coverImage = req.files.coverImage[0].path;
+  if (req.files?.cacDocument?.[0]?.path)
+    user.cacDocument = req.files.cacDocument[0].path;
+
+  user.images = uploadedImages;
+
+  user.businessApplicationStatus = "pending";
+  user.businessApplicationSubmittedAt = new Date();
+  user.businessApplicationReviewedAt = undefined;
+  user.businessApplicationReviewedBy = undefined;
+  user.businessRejectionReason = undefined;
+
+  await user.save();
+
+  // Log + mail
+  await logActivity({
+    userId: user._id,
+    action: "Business application submitted",
+    category: "Verification",
+    detail: `Application submitted for "${businessName}". Awaiting admin review.`,
+    status: "pending",
+    req,
+  });
+
+  fireMail(
+    sendApplicationSubmitted({
+      to: user.email,
+      businessName: user.businessName || businessName,
+      submittedAt: user.businessApplicationSubmittedAt,
+    })
+  );
+
+  res.status(201).json({
+    success: true,
+    message: "Business application submitted. Awaiting admin review.",
+    data: publicUser(user),
+  });
+});
+
+const getMyBusinessApplication = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      status: user.businessApplicationStatus || "none",
+      submittedAt: user.businessApplicationSubmittedAt || null,
+      reviewedAt: user.businessApplicationReviewedAt || null,
+      rejectionReason: user.businessRejectionReason || null,
+      application: publicUser(user),
+    },
+  });
+});
+
+const updateBusinessApplication = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  const status = user.businessApplicationStatus || "none";
+
+  if (status === "none") {
+    res.status(400);
+    throw new Error("You have not submitted a business application yet");
+  }
+  if (status === "approved") {
+    res.status(400);
+    throw new Error("Your application is already approved");
+  }
+
+  applyBusinessProfileFields(user, req.body);
+
+  if (req.files?.logo?.[0]?.path) user.logo = req.files.logo[0].path;
+  if (req.files?.coverImage?.[0]?.path)
+    user.coverImage = req.files.coverImage[0].path;
+  if (req.files?.cacDocument?.[0]?.path)
+    user.cacDocument = req.files.cacDocument[0].path;
+
+  let currentImages = Array.isArray(user.images) ? [...user.images] : [];
+  let removedCount = 0;
+
+  if (req.body.removeImages !== undefined) {
+    const toRemove = parseJSONMaybe(req.body.removeImages);
     if (Array.isArray(toRemove) && toRemove.length) {
       const removeSet = new Set(toRemove);
       const before = currentImages.length;
@@ -552,8 +396,8 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
   }
 
   const newUploads = (req.files?.images || []).map((f) => f.path);
-
   const projectedTotal = currentImages.length + newUploads.length;
+
   if (projectedTotal > MAX_BUSINESS_IMAGES) {
     res.status(400);
     throw new Error(
@@ -570,139 +414,397 @@ const updateBusinessProfile = asyncHandler(async (req, res) => {
     removedCount > 0 ||
     req.body.removeImages !== undefined;
 
-  if (isTouchingImages) {
-    if (currentImages.length < MIN_BUSINESS_IMAGES) {
-      res.status(400);
-      throw new Error(
-        `At least ${MIN_BUSINESS_IMAGES} business images are required (currently ${currentImages.length})`
-      );
-    }
-    if (currentImages.length > MAX_BUSINESS_IMAGES) {
-      res.status(400);
-      throw new Error(
-        `At most ${MAX_BUSINESS_IMAGES} business images are allowed (currently ${currentImages.length})`
-      );
-    }
+  if (isTouchingImages && currentImages.length < MIN_BUSINESS_IMAGES) {
+    res.status(400);
+    throw new Error(
+      `At least ${MIN_BUSINESS_IMAGES} business images are required (currently ${currentImages.length})`
+    );
   }
 
   user.images = currentImages;
 
+  const wasRejected = status === "rejected";
+
+  if (wasRejected) {
+    user.businessApplicationStatus = "pending";
+    user.businessApplicationSubmittedAt = new Date();
+    user.businessApplicationReviewedAt = undefined;
+    user.businessApplicationReviewedBy = undefined;
+    user.businessRejectionReason = undefined;
+  }
+
   await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: wasRejected
+      ? "Application updated and resubmitted"
+      : "Application details updated",
+    category: "Verification",
+    detail: wasRejected
+      ? "Rejected application was corrected and resubmitted for review."
+      : "Business application information was updated.",
+    status: wasRejected ? "pending" : "info",
+    req,
+  });
+
+  if (wasRejected) {
+    fireMail(
+      sendApplicationSubmitted({
+        to: user.email,
+        businessName: user.businessName,
+        submittedAt: user.businessApplicationSubmittedAt,
+      })
+    );
+  }
 
   res.status(200).json({
     success: true,
-    message: "Business profile updated",
+    message: wasRejected
+      ? "Application updated and resubmitted for review"
+      : "Application updated",
     data: publicUser(user),
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Request password reset OTP
-// @route   POST /api/v1/auth/business/forgot-password
-// @access  Public
-// ──────────────────────────────────────────────────────────────
-const forgotBusinessPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
-
-  if (!email) {
-    res.status(400);
-    throw new Error("Email is required");
-  }
-
-  const user = await User.findOne({ email: email.toLowerCase() });
-
+const withdrawBusinessApplication = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
   if (!user) {
-    return res.status(200).json({
-      success: true,
-      message: "If that email exists, a reset code has been sent",
-    });
+    res.status(404);
+    throw new Error("Account not found");
   }
 
-  const otp = generateOTP();
-  user.otp = otp;
-  user.otpExpire = Date.now() + OTP_TTL_MS;
-  user.otpPurpose = "password-reset";
-  await user.save({ validateBeforeSave: false });
-
-  await sendOTPEmail({ to: user.email, otp, purpose: "password-reset" });
-
-  res.status(200).json({
-    success: true,
-    message: "If that email exists, a reset code has been sent",
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Reset password using email + OTP
-// @route   POST /api/v1/auth/business/reset-password
-// @access  Public
-// ──────────────────────────────────────────────────────────────
-const resetBusinessPassword = asyncHandler(async (req, res) => {
-  const { email, otp, password } = req.body;
-
-  if (!email || !otp || !password) {
+  if (user.businessApplicationStatus !== "pending") {
     res.status(400);
-    throw new Error("Email, OTP and new password are required");
+    throw new Error("Only a pending application can be withdrawn");
   }
 
-  if (password.length < 8) {
-    res.status(400);
-    throw new Error("Password must be at least 8 characters");
-  }
+  user.businessApplicationStatus = "none";
+  user.businessApplicationSubmittedAt = undefined;
+  user.businessApplicationReviewedAt = undefined;
+  user.businessApplicationReviewedBy = undefined;
+  user.businessRejectionReason = undefined;
 
-  const user = await User.findOne({ email: email.toLowerCase() }).select(
-    "+otp +otpExpire +otpPurpose +password"
-  );
-
-  if (
-    !user ||
-    !user.otp ||
-    !user.otpExpire ||
-    user.otpPurpose !== "password-reset"
-  ) {
-    res.status(400);
-    throw new Error("Invalid or expired reset code");
-  }
-
-  if (user.otpExpire < Date.now()) {
-    res.status(400);
-    throw new Error("Reset code has expired. Please request a new one.");
-  }
-
-  if (user.otp !== otp.toString()) {
-    res.status(400);
-    throw new Error("Invalid reset code");
-  }
-
-  user.password = password;
-  user.otp = undefined;
-  user.otpExpire = undefined;
-  user.otpPurpose = undefined;
   await user.save();
 
+  await logActivity({
+    userId: user._id,
+    action: "Application withdrawn",
+    category: "Verification",
+    detail: "The pending business application was withdrawn.",
+    status: "info",
+    req,
+  });
+
   res.status(200).json({
     success: true,
-    message: "Password reset successfully. You can now log in.",
+    message: "Application withdrawn",
+    data: publicUser(user),
   });
 });
 
 // ══════════════════════════════════════════════════════════════
-// PUBLIC — no auth required
+// USER-SIDE — KYC
 // ══════════════════════════════════════════════════════════════
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Public list of approved businesses
-// @route   GET /api/v1/auth/business/public
-// @access  Public
-// Query: kind, category, city, country, minRating, featured, q,
-//        sort, page, limit
-// ──────────────────────────────────────────────────────────────
-const getPublicBusinesses = asyncHandler(async (req, res) => {
+const submitBusinessKYC = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  if (!user.isVerified) {
+    res.status(403);
+    throw new Error(
+      "Verify your email before submitting business verification"
+    );
+  }
+
+  if (user.kycStatus === "pending") {
+    res.status(400);
+    throw new Error(
+      "You already have a KYC submission pending review. Update it instead."
+    );
+  }
+
+  if (user.kycStatus === "approved") {
+    res.status(400);
+    throw new Error("Your KYC is already approved");
+  }
+
+  const { ownerLegalName, idNumber, operatingAddress } = req.body;
+
+  if (!ownerLegalName || !idNumber || !operatingAddress) {
+    res.status(400);
+    throw new Error(
+      "ownerLegalName, idNumber and operatingAddress are required"
+    );
+  }
+
+  const accepted =
+    req.body.kycDeclarationAccepted === true ||
+    req.body.kycDeclarationAccepted === "true";
+  if (!accepted) {
+    res.status(400);
+    throw new Error(
+      "You must accept the compliance declaration before submitting"
+    );
+  }
+  user.kycDeclarationAccepted = true;
+
+  applyBusinessProfileFields(user, req.body);
+
+  if (req.body.businessKind !== undefined) {
+    const kind = String(req.body.businessKind).trim().toLowerCase();
+    if (!VALID_BUSINESS_KINDS.includes(kind)) {
+      res.status(400);
+      throw new Error(
+        `businessKind must be one of: ${VALID_BUSINESS_KINDS.join(", ")}`
+      );
+    }
+    if (kind === "others") {
+      const other =
+        typeof req.body.businessKindOther === "string"
+          ? req.body.businessKindOther.trim()
+          : "";
+      if (!other) {
+        res.status(400);
+        throw new Error(
+          'businessKindOther is required when businessKind is "others"'
+        );
+      }
+    }
+  }
+
+  applyKYCFields(user, req.body);
+
+  if (req.files?.idDocument?.[0]?.path)
+    user.idDocument = req.files.idDocument[0].path;
+  if (req.files?.cacDocument?.[0]?.path)
+    user.cacDocument = req.files.cacDocument[0].path;
+  if (req.files?.activityProof?.[0]?.path)
+    user.activityProofFile = req.files.activityProof[0].path;
+  if (req.files?.utilityBill?.[0]?.path)
+    user.utilityBillFile = req.files.utilityBill[0].path;
+  if (req.files?.regulatoryLicence?.[0]?.path)
+    user.regulatoryLicenceFile = req.files.regulatoryLicence[0].path;
+
+  if (req.files?.logo?.[0]?.path) user.logo = req.files.logo[0].path;
+  if (req.files?.coverImage?.[0]?.path)
+    user.coverImage = req.files.coverImage[0].path;
+
+  const newGallery = (req.files?.images || []).map((f) => f.path);
+  if (newGallery.length > 0) {
+    let currentImages = Array.isArray(user.images) ? [...user.images] : [];
+    if (req.body.removeImages !== undefined) {
+      const toRemove = parseJSONMaybe(req.body.removeImages);
+      if (Array.isArray(toRemove) && toRemove.length) {
+        const removeSet = new Set(toRemove);
+        currentImages = currentImages.filter((url) => !removeSet.has(url));
+      }
+    }
+    const next = [...currentImages, ...newGallery];
+    if (next.length > MAX_BUSINESS_IMAGES) {
+      res.status(400);
+      throw new Error(
+        `A business can have at most ${MAX_BUSINESS_IMAGES} images`
+      );
+    }
+    user.images = next;
+  }
+
+  user.kycStatus = "pending";
+  user.kycSubmittedAt = new Date();
+  user.kycReviewedAt = undefined;
+  user.kycReviewedBy = undefined;
+  user.kycRejectionReason = undefined;
+  user.duplicateListingChecked = true;
+
+  if (
+    user.businessApplicationStatus === "none" ||
+    user.businessApplicationStatus === "rejected"
+  ) {
+    user.businessApplicationStatus = "pending";
+    user.businessApplicationSubmittedAt = new Date();
+    user.businessApplicationReviewedAt = undefined;
+    user.businessApplicationReviewedBy = undefined;
+    user.businessRejectionReason = undefined;
+  }
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: "KYC verification submitted",
+    category: "Verification",
+    detail:
+      "Corporate documents, identity, and licences submitted for compliance review.",
+    status: "pending",
+    req,
+  });
+
+  fireMail(
+    sendKYCSubmitted({
+      to: user.email,
+      businessName: user.businessName || user.fullName,
+      submittedAt: user.kycSubmittedAt,
+    })
+  );
+
+  res.status(201).json({
+    success: true,
+    message:
+      "Verification submission received. Our compliance team will review your credentials within 24–48 hours.",
+    data: publicUser(user),
+  });
+});
+
+const getMyBusinessKYC = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      status: user.kycStatus || "none",
+      submittedAt: user.kycSubmittedAt || null,
+      reviewedAt: user.kycReviewedAt || null,
+      rejectionReason: user.kycRejectionReason || null,
+      kyc: publicUser(user),
+    },
+  });
+});
+
+const updateBusinessKYC = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  const status = user.kycStatus || "none";
+
+  if (status === "none") {
+    res.status(400);
+    throw new Error("You have not submitted KYC yet");
+  }
+  if (status === "approved") {
+    res.status(400);
+    throw new Error("Your KYC is already approved");
+  }
+
+  applyKYCFields(user, req.body);
+
+  if (req.files?.idDocument?.[0]?.path)
+    user.idDocument = req.files.idDocument[0].path;
+  if (req.files?.cacDocument?.[0]?.path)
+    user.cacDocument = req.files.cacDocument[0].path;
+  if (req.files?.activityProof?.[0]?.path)
+    user.activityProofFile = req.files.activityProof[0].path;
+  if (req.files?.utilityBill?.[0]?.path)
+    user.utilityBillFile = req.files.utilityBill[0].path;
+  if (req.files?.regulatoryLicence?.[0]?.path)
+    user.regulatoryLicenceFile = req.files.regulatoryLicence[0].path;
+
+  const wasRejected = status === "rejected";
+
+  if (wasRejected) {
+    user.kycStatus = "pending";
+    user.kycSubmittedAt = new Date();
+    user.kycReviewedAt = undefined;
+    user.kycReviewedBy = undefined;
+    user.kycRejectionReason = undefined;
+  }
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: wasRejected
+      ? "KYC resubmitted after rejection"
+      : "KYC submission updated",
+    category: "Verification",
+    detail: wasRejected
+      ? "Corrected KYC documents were resubmitted for review."
+      : "KYC details were updated. Review continues.",
+    status: wasRejected ? "pending" : "info",
+    req,
+  });
+
+  if (wasRejected) {
+    fireMail(
+      sendKYCSubmitted({
+        to: user.email,
+        businessName: user.businessName || user.fullName,
+        submittedAt: user.kycSubmittedAt,
+      })
+    );
+  }
+
+  res.status(200).json({
+    success: true,
+    message: wasRejected
+      ? "KYC updated and resubmitted for review"
+      : "KYC updated",
+    data: publicUser(user),
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
+// USER-SIDE — activity log
+// ══════════════════════════════════════════════════════════════
+
+const getMyActivityLog = asyncHandler(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(
-    50,
-    Math.max(1, parseInt(req.query.limit, 10) || 20)
+    100,
+    Math.max(1, parseInt(req.query.limit, 10) || 50)
   );
+  const skip = (page - 1) * limit;
+
+  const filter = { user: req.user._id };
+
+  if (req.query.category && req.query.category !== "all") {
+    filter.category = req.query.category;
+  }
+
+  if (req.query.q) {
+    const q = String(req.query.q).trim();
+    filter.$or = [
+      { action: { $regex: q, $options: "i" } },
+      { detail: { $regex: q, $options: "i" } },
+    ];
+  }
+
+  const [logs, total] = await Promise.all([
+    ActivityLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    ActivityLog.countDocuments(filter),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: logs,
+    pagination: {
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+      hasMore: skip + logs.length < total,
+    },
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC
+// ══════════════════════════════════════════════════════════════
+
+const getPublicBusinesses = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const skip = (page - 1) * limit;
 
   const filter = {
@@ -716,9 +818,7 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
 
   if (req.query.kind) {
     const k = String(req.query.kind).trim().toLowerCase();
-    if (VALID_BUSINESS_KINDS.includes(k)) {
-      filter.businessKind = k;
-    }
+    if (VALID_BUSINESS_KINDS.includes(k)) filter.businessKind = k;
   }
 
   if (req.query.category) {
@@ -739,9 +839,7 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
 
   if (req.query.minRating) {
     const r = Number(req.query.minRating);
-    if (!Number.isNaN(r) && r >= 0 && r <= 5) {
-      filter.rating = { $gte: r };
-    }
+    if (!Number.isNaN(r) && r >= 0 && r <= 5) filter.rating = { $gte: r };
   }
 
   if (req.query.featured === "true" || req.query.featured === true) {
@@ -755,6 +853,10 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     });
   }
 
+  if (req.query.kycVerified === "true" || req.query.kycVerified === true) {
+    filter.kycStatus = "approved";
+  }
+
   if (req.query.q) {
     const q = String(req.query.q).trim();
     andClauses.push({
@@ -765,9 +867,7 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     });
   }
 
-  if (andClauses.length > 0) {
-    filter.$and = andClauses;
-  }
+  if (andClauses.length) filter.$and = andClauses;
 
   const SORTS = {
     rating: { rating: -1, numReviews: -1 },
@@ -777,6 +877,7 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
     views: { viewCount: -1 },
     popular: { numReviews: -1, rating: -1 },
     featured: { isFeatured: -1, rating: -1 },
+    trust: { kycStatus: -1, rating: -1 },
   };
   const sort =
     SORTS[req.query.sort] || { isFeatured: -1, rating: -1, numReviews: -1 };
@@ -805,11 +906,6 @@ const getPublicBusinesses = asyncHandler(async (req, res) => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Public single business by id
-// @route   GET /api/v1/auth/business/public/:id
-// @access  Public
-// ──────────────────────────────────────────────────────────────
 const getPublicBusinessById = asyncHandler(async (req, res) => {
   const business = await User.findOne({
     _id: req.params.id,
@@ -824,57 +920,53 @@ const getPublicBusinessById = asyncHandler(async (req, res) => {
     throw new Error("Business not found");
   }
 
-  // Bump view count without blocking the response
-  User.updateOne(
-    { _id: business._id },
-    { $inc: { viewCount: 1 } }
-  ).catch(() => {});
+  User.updateOne({ _id: business._id }, { $inc: { viewCount: 1 } }).catch(
+    () => {}
+  );
 
-  res.status(200).json({
-    success: true,
-    data: business,
-  });
+  res.status(200).json({ success: true, data: business });
 });
 
 // ══════════════════════════════════════════════════════════════
-// BUSINESS APPROVAL (called from admin UI)
+// ADMIN — business application review
 // ══════════════════════════════════════════════════════════════
 
-// ──────────────────────────────────────────────────────────────
-// @desc    List business accounts
-// @route   GET /api/v1/auth/business/all
-// @access  Private (admin)
-// ──────────────────────────────────────────────────────────────
-const listBusinesses = asyncHandler(async (req, res) => {
+const listBusinessApplications = asyncHandler(async (req, res) => {
   const { status = "pending", page = 1, limit = 20 } = req.query;
 
-  const filter = { role: "business" };
+  const filter = {};
 
-  if (status === "pending") {
-    filter.isVerified = true;
-    filter.businessVerified = false;
-    filter.businessRejectionReason = { $in: [null, undefined, ""] };
-  } else if (status === "approved") {
-    filter.businessVerified = true;
-  } else if (status === "rejected") {
-    filter.businessVerified = false;
-    filter.businessRejectionReason = { $nin: [null, undefined, ""] };
-  } else if (status === "unverified") {
-    filter.isVerified = false;
-  } else if (status === "featured") {
-    filter.isFeatured = true;
+  switch (status) {
+    case "pending":
+      filter.businessApplicationStatus = "pending";
+      break;
+    case "approved":
+      filter.role = "business";
+      filter.businessVerified = true;
+      break;
+    case "rejected":
+      filter.businessApplicationStatus = "rejected";
+      break;
+    case "featured":
+      filter.role = "business";
+      filter.isFeatured = true;
+      break;
+    case "all":
+      break;
+    default:
+      filter.businessApplicationStatus = status;
   }
 
   const skip = (Number(page) - 1) * Number(limit);
 
-  const [businesses, total] = await Promise.all([
+  const [applications, total] = await Promise.all([
     User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
     User.countDocuments(filter),
   ]);
 
   res.status(200).json({
     success: true,
-    data: businesses.map(publicUser),
+    data: applications.map(publicUser),
     pagination: {
       total,
       page: Number(page),
@@ -884,114 +976,121 @@ const listBusinesses = asyncHandler(async (req, res) => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Get one business by id
-// @route   GET /api/v1/auth/business/all/:id
-// @access  Private (admin)
-// ──────────────────────────────────────────────────────────────
-const getBusinessById = asyncHandler(async (req, res) => {
-  const business = await User.findOne({
-    _id: req.params.id,
-    role: "business",
+const getBusinessApplicationById = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Application not found");
+  }
+  res.status(200).json({ success: true, data: publicUser(user) });
+});
+
+const approveBusinessApplication = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Application not found");
+  }
+
+  if (user.businessApplicationStatus !== "pending") {
+    res.status(400);
+    throw new Error("Only pending applications can be approved");
+  }
+
+  if (!user.isVerified) {
+    res.status(400);
+    throw new Error("Applicant has not verified their email yet");
+  }
+
+  user.role = "business";
+  user.businessVerified = true;
+  user.businessVerifiedAt = new Date();
+  user.businessVerifiedBy = req.user._id;
+  user.businessRejectionReason = undefined;
+
+  user.businessApplicationStatus = "approved";
+  user.businessApplicationReviewedAt = new Date();
+  user.businessApplicationReviewedBy = req.user._id;
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: "Business account approved",
+    category: "Verification",
+    detail: "Your business account has been approved. Welcome aboard!",
+    status: "success",
+    req,
   });
 
-  if (!business) {
-    res.status(404);
-    throw new Error("Business not found");
-  }
+  fireMail(
+    sendApplicationApproved({
+      to: user.email,
+      businessName: user.businessName || user.fullName,
+    })
+  );
 
   res.status(200).json({
     success: true,
-    data: publicUser(business),
+    message: "Business application approved",
+    data: publicUser(user),
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Approve a business account
-// @route   PATCH /api/v1/auth/business/all/:id/approve
-// @access  Private (admin)
-// ──────────────────────────────────────────────────────────────
-const approveBusiness = asyncHandler(async (req, res) => {
-  const business = await User.findOne({
-    _id: req.params.id,
-    role: "business",
-  });
-
-  if (!business) {
-    res.status(404);
-    throw new Error("Business not found");
-  }
-
-  if (!business.isVerified) {
-    res.status(400);
-    throw new Error("Business email is not verified yet");
-  }
-
-  if (business.businessVerified) {
-    res.status(400);
-    throw new Error("Business is already approved");
-  }
-
-  business.businessVerified = true;
-  business.businessVerifiedAt = new Date();
-  business.businessVerifiedBy = req.user._id;
-  business.businessRejectionReason = undefined;
-  await business.save();
-
-  res.status(200).json({
-    success: true,
-    message: "Business approved successfully",
-    data: publicUser(business),
-  });
-});
-
-// ──────────────────────────────────────────────────────────────
-// @desc    Reject a business account
-// @route   PATCH /api/v1/auth/business/all/:id/reject
-// @access  Private (admin)
-// ──────────────────────────────────────────────────────────────
-const rejectBusiness = asyncHandler(async (req, res) => {
+const rejectBusinessApplication = asyncHandler(async (req, res) => {
   const { reason } = req.body;
-
   if (!reason) {
     res.status(400);
     throw new Error("Rejection reason is required");
   }
 
-  const business = await User.findOne({
-    _id: req.params.id,
-    role: "business",
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("Application not found");
+  }
+
+  if (user.businessApplicationStatus !== "pending") {
+    res.status(400);
+    throw new Error("Only pending applications can be rejected");
+  }
+
+  user.businessApplicationStatus = "rejected";
+  user.businessApplicationReviewedAt = new Date();
+  user.businessApplicationReviewedBy = req.user._id;
+  user.businessRejectionReason = reason;
+
+  user.role = user.role === "business" ? "user" : user.role;
+  user.businessVerified = false;
+  user.businessVerifiedAt = undefined;
+  user.businessVerifiedBy = undefined;
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: "Business application rejected",
+    category: "Verification",
+    detail: `Reason: ${reason}`,
+    status: "error",
+    req,
   });
 
-  if (!business) {
-    res.status(404);
-    throw new Error("Business not found");
-  }
-
-  if (business.businessVerified) {
-    res.status(400);
-    throw new Error("Business is already approved");
-  }
-
-  business.businessVerified = false;
-  business.businessVerifiedAt = undefined;
-  business.businessVerifiedBy = req.user._id;
-  business.businessRejectionReason = reason;
-  await business.save();
+  fireMail(
+    sendApplicationRejected({
+      to: user.email,
+      businessName: user.businessName || user.fullName,
+      reason,
+    })
+  );
 
   res.status(200).json({
     success: true,
-    message: "Business rejected",
-    data: publicUser(business),
+    message: "Business application rejected",
+    data: publicUser(user),
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// @desc    Toggle featured status for a business
-// @route   PATCH /api/v1/auth/business/all/:id/feature
-// @access  Private (admin)
-// Body: { featured: bool, plan?, until?, notes? }
-// ──────────────────────────────────────────────────────────────
 const toggleBusinessFeatured = asyncHandler(async (req, res) => {
   const { featured, plan = null, until = null, notes = "" } = req.body;
 
@@ -1009,7 +1108,6 @@ const toggleBusinessFeatured = asyncHandler(async (req, res) => {
     _id: req.params.id,
     role: "business",
   });
-
   if (!business) {
     res.status(404);
     throw new Error("Business not found");
@@ -1045,6 +1143,31 @@ const toggleBusinessFeatured = asyncHandler(async (req, res) => {
 
   await business.save();
 
+  await logActivity({
+    userId: business._id,
+    action: featured
+      ? "Business marked as featured"
+      : "Business removed from featured",
+    category: "Advertising",
+    detail: featured
+      ? `Featured plan: ${business.featuredPlan || "basic"}.`
+      : "Featured status was removed by admin.",
+    status: featured ? "success" : "info",
+    req,
+  });
+
+  // Only mail on the positive action
+  if (featured) {
+    fireMail(
+      sendBusinessFeatured({
+        to: business.email,
+        businessName: business.businessName || business.fullName,
+        plan: business.featuredPlan,
+        until: business.featuredUntil,
+      })
+    );
+  }
+
   res.status(200).json({
     success: true,
     message: featured
@@ -1054,24 +1177,190 @@ const toggleBusinessFeatured = asyncHandler(async (req, res) => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════
+// ADMIN — KYC review
+// ══════════════════════════════════════════════════════════════
+
+const listBusinessKYC = asyncHandler(async (req, res) => {
+  const { status = "pending", page = 1, limit = 20 } = req.query;
+
+  const filter = {};
+
+  switch (status) {
+    case "pending":
+      filter.kycStatus = "pending";
+      break;
+    case "approved":
+      filter.kycStatus = "approved";
+      break;
+    case "rejected":
+      filter.kycStatus = "rejected";
+      break;
+    case "all":
+      filter.kycStatus = { $in: ["pending", "approved", "rejected"] };
+      break;
+    default:
+      filter.kycStatus = status;
+  }
+
+  const skip = (Number(page) - 1) * Number(limit);
+
+  const [submissions, total] = await Promise.all([
+    User.find(filter)
+      .sort({ kycSubmittedAt: -1 })
+      .skip(skip)
+      .limit(Number(limit)),
+    User.countDocuments(filter),
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: submissions.map(publicUser),
+    pagination: {
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      pages: Math.ceil(total / Number(limit)),
+    },
+  });
+});
+
+const getBusinessKYCById = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("KYC submission not found");
+  }
+  res.status(200).json({ success: true, data: publicUser(user) });
+});
+
+const approveBusinessKYC = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("KYC submission not found");
+  }
+
+  if (user.kycStatus !== "pending") {
+    res.status(400);
+    throw new Error("Only pending KYC submissions can be approved");
+  }
+
+  user.kycStatus = "approved";
+  user.kycReviewedAt = new Date();
+  user.kycReviewedBy = req.user._id;
+  user.kycRejectionReason = undefined;
+
+  if (!user.businessVerified) {
+    user.role = "business";
+    user.businessVerified = true;
+    user.businessVerifiedAt = new Date();
+    user.businessVerifiedBy = req.user._id;
+  }
+
+  if (user.businessApplicationStatus !== "approved") {
+    user.businessApplicationStatus = "approved";
+    user.businessApplicationReviewedAt = new Date();
+    user.businessApplicationReviewedBy = req.user._id;
+    user.businessRejectionReason = undefined;
+  }
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: "KYC approved — Trust Badge issued",
+    category: "Verification",
+    detail:
+      "Your account passed compliance review. The Verified Trust Badge is now live on your public listing.",
+    status: "success",
+    req,
+  });
+
+  fireMail(
+    sendKYCApproved({
+      to: user.email,
+      businessName: user.businessName || user.fullName,
+    })
+  );
+
+  res.status(200).json({
+    success: true,
+    message: "KYC approved — Trust Badge issued",
+    data: publicUser(user),
+  });
+});
+
+const rejectBusinessKYC = asyncHandler(async (req, res) => {
+  const { reason } = req.body;
+  if (!reason) {
+    res.status(400);
+    throw new Error("Rejection reason is required");
+  }
+
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    res.status(404);
+    throw new Error("KYC submission not found");
+  }
+
+  if (user.kycStatus !== "pending") {
+    res.status(400);
+    throw new Error("Only pending KYC submissions can be rejected");
+  }
+
+  user.kycStatus = "rejected";
+  user.kycReviewedAt = new Date();
+  user.kycReviewedBy = req.user._id;
+  user.kycRejectionReason = reason;
+
+  await user.save();
+
+  await logActivity({
+    userId: user._id,
+    action: "KYC rejected",
+    category: "Verification",
+    detail: `Reason: ${reason}`,
+    status: "error",
+    req,
+  });
+
+  fireMail(
+    sendKYCRejected({
+      to: user.email,
+      businessName: user.businessName || user.fullName,
+      reason,
+    })
+  );
+
+  res.status(200).json({
+    success: true,
+    message: "KYC rejected",
+    data: publicUser(user),
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
+// EXPORTS
+// ══════════════════════════════════════════════════════════════
 export {
-  // public
+  submitBusinessApplication,
+  getMyBusinessApplication,
+  updateBusinessApplication,
+  withdrawBusinessApplication,
+  submitBusinessKYC,
+  getMyBusinessKYC,
+  updateBusinessKYC,
+  getMyActivityLog,
   getPublicBusinesses,
   getPublicBusinessById,
-  // auth
-  registerBusinessAccount,
-  verifyBusinessAccount,
-  resendBusinessOTP,
-  loginBusinessAccount,
-  logoutBusinessAccount,
-  getCurrentBusinessAccount,
-  updateBusinessProfile,
-  forgotBusinessPassword,
-  resetBusinessPassword,
-  // admin approval
-  listBusinesses,
-  getBusinessById,
-  approveBusiness,
-  rejectBusiness,
+  listBusinessApplications,
+  getBusinessApplicationById,
+  approveBusinessApplication,
+  rejectBusinessApplication,
   toggleBusinessFeatured,
+  listBusinessKYC,
+  getBusinessKYCById,
+  approveBusinessKYC,
+  rejectBusinessKYC,
 };

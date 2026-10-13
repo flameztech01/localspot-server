@@ -8,6 +8,7 @@ import mongoose from 'mongoose';
 import { notFound, errorHandler } from './middleware/errorMiddleware.js';
 
 
+import authRoutes from "./routes/authRoutes.js";  
 import businessRoutes from './routes/businessRoutes.js';
 import discoveryRoutes from "./routes/discoveryRoutes.js";
 import promotionRoutes from "./routes/promotionRoutes.js";
@@ -58,7 +59,8 @@ app.get("/", (req, res) => {
   res.send("localspot API is running 🚀");
 });
 
-app.use('/api/v1/auth/business', businessRoutes);
+app.use("/api/v1/auth", authRoutes);
+app.use("/api/v1/business", businessRoutes);
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/promotions/admin", adminPromotionRoutes);
 app.use("/api/v1/promotions", promotionRoutes);

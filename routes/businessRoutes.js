@@ -5,25 +5,31 @@ import { v2 as cloudinary } from "cloudinary";
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 
 import {
+  // user-side application
+  submitBusinessApplication,
+  getMyBusinessApplication,
+  updateBusinessApplication,
+  withdrawBusinessApplication,
+  // user-side KYC
+  submitBusinessKYC,
+  getMyBusinessKYC,
+  updateBusinessKYC,
+  // user-side activity
+  getMyActivityLog,
   // public
   getPublicBusinesses,
   getPublicBusinessById,
-  // auth
-  registerBusinessAccount,
-  verifyBusinessAccount,
-  resendBusinessOTP,
-  loginBusinessAccount,
-  logoutBusinessAccount,
-  getCurrentBusinessAccount,
-  updateBusinessProfile,
-  forgotBusinessPassword,
-  resetBusinessPassword,
-  // admin
-  listBusinesses,
-  getBusinessById,
-  approveBusiness,
-  rejectBusiness,
+  // admin — application
+  listBusinessApplications,
+  getBusinessApplicationById,
+  approveBusinessApplication,
+  rejectBusinessApplication,
   toggleBusinessFeatured,
+  // admin — KYC
+  listBusinessKYC,
+  getBusinessKYCById,
+  approveBusinessKYC,
+  rejectBusinessKYC,
 } from "../controllers/businessController.js";
 import { protect } from "../middleware/authMiddleware.js";
 
@@ -38,13 +44,45 @@ cloudinary.config({
   api_secret: process.env.API_SECRET,
 });
 
-// Per-field storage: logo gets square crop, coverImage gets 16:6,
-// images get a general 4:3 limited crop.
+// Per-field storage:
+//   logo              → square avatar
+//   coverImage        → wide hero banner
+//   images            → gallery (4:3 limit)
+//   cacDocument       → raw file (image or pdf)
+//   idDocument        → raw file (image or pdf)
+//   activityProof     → storefront photo
+//   utilityBill       → raw file (image or pdf)
+//   regulatoryLicence → raw file (image or pdf)
 const storage = new CloudinaryStorage({
   cloudinary,
   params: (req, file) => {
+    // Raw documents → store as-is in a documents folder
+    const rawDocFields = [
+      "cacDocument",
+      "idDocument",
+      "utilityBill",
+      "regulatoryLicence",
+    ];
+    if (rawDocFields.includes(file.fieldname)) {
+      return {
+        folder: "BusinessApplications/Documents",
+        resource_type: "auto",
+        allowed_formats: ["jpg", "png", "jpeg", "webp", "pdf"],
+      };
+    }
+
+    // Storefront / activity proof → image, moderate crop
+    if (file.fieldname === "activityProof") {
+      return {
+        folder: "BusinessApplications/Activity",
+        allowed_formats: ["jpg", "png", "jpeg", "webp"],
+        resource_type: "image",
+        transformation: [{ width: 1600, height: 1200, crop: "limit" }],
+      };
+    }
+
     const base = {
-      folder: "BusinessProfiles",
+      folder: "BusinessApplications",
       allowed_formats: ["jpg", "png", "jpeg", "webp"],
       resource_type: "image",
     };
@@ -52,7 +90,6 @@ const storage = new CloudinaryStorage({
     if (file.fieldname === "logo") {
       return {
         ...base,
-        // Square avatar, cropped tightly
         transformation: [
           { width: 600, height: 600, crop: "fill", gravity: "auto" },
         ],
@@ -62,7 +99,6 @@ const storage = new CloudinaryStorage({
     if (file.fieldname === "coverImage") {
       return {
         ...base,
-        // Wide hero banner
         transformation: [
           { width: 1600, height: 600, crop: "fill", gravity: "auto" },
         ],
@@ -81,9 +117,35 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 8 * 1024 * 1024, // 8 MB per file
-    files: 22, // 20 gallery + 1 cover + 1 logo
+    files: 23, // 20 gallery + 1 cover + 1 logo + 1 CAC document
   },
 });
+
+// ──────────────────────────────────────────────────────────────
+// Field maps
+// ──────────────────────────────────────────────────────────────
+
+// Application upload: full profile submission
+const businessApplicationUpload = upload.fields([
+  { name: "images", maxCount: 20 },
+  { name: "logo", maxCount: 1 },
+  { name: "coverImage", maxCount: 1 },
+  { name: "cacDocument", maxCount: 1 },
+]);
+
+// KYC upload: verification documents.
+// Also accepts optional logo / cover / gallery so a fresh signup
+// can send everything through /kyc if they never hit /apply.
+const businessKYCUpload = upload.fields([
+  { name: "idDocument", maxCount: 1 },
+  { name: "cacDocument", maxCount: 1 },
+  { name: "activityProof", maxCount: 1 },
+  { name: "utilityBill", maxCount: 1 },
+  { name: "regulatoryLicence", maxCount: 1 },
+  { name: "logo", maxCount: 1 },
+  { name: "coverImage", maxCount: 1 },
+  { name: "images", maxCount: 20 },
+]);
 
 // Inline admin gate (assumes `protect` ran first and set req.user)
 const isAdmin = (req, res, next) => {
@@ -101,39 +163,97 @@ router.get("/public", getPublicBusinesses);
 router.get("/public/:id", getPublicBusinessById);
 
 // ──────────────────────────────────────────────────────────────
-// Auth flows (public)
+// Signed-in user — business application
 // ──────────────────────────────────────────────────────────────
-router.post("/register", registerBusinessAccount);
-router.post("/verify-otp", verifyBusinessAccount);
-router.post("/resend-otp", resendBusinessOTP);
-router.post("/login", loginBusinessAccount);
-router.post("/forgot-password", forgotBusinessPassword);
-router.post("/reset-password", resetBusinessPassword);
+router.post(
+  "/apply",
+  protect,
+  businessApplicationUpload,
+  submitBusinessApplication
+);
 
-// ──────────────────────────────────────────────────────────────
-// Private — business owner
-// ──────────────────────────────────────────────────────────────
-router.post("/logout", protect, logoutBusinessAccount);
-router.get("/me", protect, getCurrentBusinessAccount);
+router.get("/application", protect, getMyBusinessApplication);
 
 router.put(
-  "/profile",
+  "/application",
   protect,
-  upload.fields([
-    { name: "logo", maxCount: 1 },
-    { name: "coverImage", maxCount: 1 },
-    { name: "images", maxCount: 20 },
-  ]),
-  updateBusinessProfile
+  businessApplicationUpload,
+  updateBusinessApplication
+);
+
+router.delete("/application", protect, withdrawBusinessApplication);
+
+// ──────────────────────────────────────────────────────────────
+// Signed-in user — KYC / Trust Badge
+// ──────────────────────────────────────────────────────────────
+router.post("/kyc", protect, businessKYCUpload, submitBusinessKYC);
+
+router.get("/kyc", protect, getMyBusinessKYC);
+
+router.put("/kyc", protect, businessKYCUpload, updateBusinessKYC);
+
+// ──────────────────────────────────────────────────────────────
+// Signed-in user — activity log
+// ──────────────────────────────────────────────────────────────
+router.get("/activity", protect, getMyActivityLog);
+
+// ──────────────────────────────────────────────────────────────
+// Admin only — review & manage business applications
+// ──────────────────────────────────────────────────────────────
+router.get("/applications", protect, isAdmin, listBusinessApplications);
+
+router.get(
+  "/applications/:id",
+  protect,
+  isAdmin,
+  getBusinessApplicationById
+);
+
+router.patch(
+  "/applications/:id/approve",
+  protect,
+  isAdmin,
+  approveBusinessApplication
+);
+
+router.patch(
+  "/applications/:id/reject",
+  protect,
+  isAdmin,
+  rejectBusinessApplication
+);
+
+router.patch(
+  "/applications/:id/feature",
+  protect,
+  isAdmin,
+  toggleBusinessFeatured
 );
 
 // ──────────────────────────────────────────────────────────────
-// Admin only — approval management
+// Admin only — review & manage KYC submissions
 // ──────────────────────────────────────────────────────────────
-router.get("/all", protect, isAdmin, listBusinesses);
-router.get("/all/:id", protect, isAdmin, getBusinessById);
-router.patch("/all/:id/approve", protect, isAdmin, approveBusiness);
-router.patch("/all/:id/reject", protect, isAdmin, rejectBusiness);
-router.patch("/all/:id/feature", protect, isAdmin, toggleBusinessFeatured);
+router.get("/kyc-submissions", protect, isAdmin, listBusinessKYC);
+
+router.get(
+  "/kyc-submissions/:id",
+  protect,
+  isAdmin,
+  getBusinessKYCById
+);
+
+router.patch(
+  "/kyc-submissions/:id/approve",
+  protect,
+  isAdmin,
+  approveBusinessKYC
+);
+
+router.patch(
+  "/kyc-submissions/:id/reject",
+  protect,
+  isAdmin,
+  rejectBusinessKYC
+);
 
 export default router;

@@ -25,8 +25,8 @@ const userSchema = new mongoose.Schema(
     // ── Role ─────────────────────────────────────────────────
     role: {
       type: String,
-      enum: ["business", "admin"],
-      default: "business",
+      enum: ["user", "business", "admin"],
+      default: "user",
     },
 
     // ── Email verification (OTP) ─────────────────────────────
@@ -163,6 +163,86 @@ const userSchema = new mongoose.Schema(
       default: null,
     },
     featuredNotes: { type: String, trim: true, maxlength: 500 },
+
+    // ─────────────────────────────────────────────────────────
+    // BUSINESS APPLICATION WORKFLOW
+    // Collected at signup-application time (before admin approval)
+    // ─────────────────────────────────────────────────────────
+    businessApplicationStatus: {
+      type: String,
+      enum: ["none", "pending", "approved", "rejected"],
+      default: "none",
+      index: true,
+    },
+    businessApplicationSubmittedAt: { type: Date },
+    businessApplicationReviewedAt: { type: Date },
+    businessApplicationReviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+
+    // ── CAC / registration (application stage) ──────────────
+    cacNumber: { type: String, trim: true },
+    cacDocument: { type: String, trim: true }, // uploaded file URL
+
+    // ─────────────────────────────────────────────────────────
+    // KYC / TRUST BADGE WORKFLOW
+    // Collected AFTER approval — earns the Verified Trust Badge
+    // ─────────────────────────────────────────────────────────
+    kycStatus: {
+      type: String,
+      enum: ["none", "pending", "approved", "rejected"],
+      default: "none",
+      index: true,
+    },
+    kycSubmittedAt: { type: Date },
+    kycReviewedAt: { type: Date },
+    kycReviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    kycRejectionReason: { type: String, trim: true },
+
+    // ── Representative (owner / director / agent) ───────────
+    representativeType: {
+      type: String,
+      enum: ["owner", "director", "agent"],
+      default: "owner",
+    },
+    ownerLegalName: { type: String, trim: true },
+    ownerDob: { type: Date },
+
+    // ── Government ID ───────────────────────────────────────
+    idType: {
+      type: String,
+      enum: ["nin", "passport", "drivers_license", "voters_card"],
+    },
+    idNumber: { type: String, trim: true },
+    idDocument: { type: String, trim: true }, // upload URL
+
+    // ── CAC registry cross-check ────────────────────────────
+    registeredBusinessName: { type: String, trim: true },
+    registrationType: {
+      type: String,
+      enum: ["llc", "bn", "partnership", "corp"],
+    },
+    cacStatus: { type: String, trim: true },
+    activityProofFile: { type: String, trim: true }, // storefront photo URL
+
+    // ── Address & service-area verification ─────────────────
+    operatingAddress: { type: String, trim: true },
+    utilityBillFile: { type: String, trim: true },
+    duplicateListingChecked: { type: Boolean, default: false },
+
+    // ── Category-specific licences ──────────────────────────
+    riskCategory: { type: String, trim: true },
+    foodLicenceNumber: { type: String, trim: true },
+    foodLicenceExpiry: { type: Date },
+    liquorLicenceNumber: { type: String, trim: true },
+    regulatoryLicenceFile: { type: String, trim: true },
+
+    // ── Declaration ─────────────────────────────────────────
+    kycDeclarationAccepted: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -177,6 +257,9 @@ userSchema.index({
   isActive: 1,
   rating: -1,
 });
+// Admin review queues
+userSchema.index({ businessApplicationStatus: 1, createdAt: -1 });
+userSchema.index({ kycStatus: 1, kycSubmittedAt: -1 });
 
 // ── Hooks ──────────────────────────────────────────────────
 userSchema.pre("save", async function () {
