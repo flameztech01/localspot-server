@@ -1,3 +1,4 @@
+// src/app.js
 import express from 'express';
 import bodyParser from 'body-parser';
 import cookieParser from 'cookie-parser';
@@ -7,9 +8,9 @@ import mongoose from 'mongoose';
 
 import { notFound, errorHandler } from './middleware/errorMiddleware.js';
 
-
-import authRoutes from "./routes/authRoutes.js";  
+import authRoutes from "./routes/authRoutes.js";
 import businessRoutes from './routes/businessRoutes.js';
+import bookingRoutes from './routes/bookingRoutes.js';
 import discoveryRoutes from "./routes/discoveryRoutes.js";
 import promotionRoutes from "./routes/promotionRoutes.js";
 import adminPromotionRoutes from "./routes/adminPromotionRoutes.js";
@@ -24,8 +25,6 @@ import savedPlaceRoutes from "./routes/savedPlaceRoutes.js";
 
 const app = express();
 dotenv.config();
-
-
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/myapp';
@@ -61,6 +60,7 @@ app.get("/", (req, res) => {
 
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/business", businessRoutes);
+app.use("/api/v1/bookings", bookingRoutes);
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/promotions/admin", adminPromotionRoutes);
 app.use("/api/v1/promotions", promotionRoutes);
@@ -72,7 +72,6 @@ app.use("/api/v1/business/reviews", businessReviewRoutes);
 app.use("/api/v1/reviews", reviewRoutes);
 app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/saved-places", savedPlaceRoutes);
-
 
 // ─── Error handling ──────────────────────────────────────────────
 app.use(notFound);

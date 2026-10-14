@@ -21,6 +21,7 @@ const activityLogSchema = new mongoose.Schema(
         "Account",
         "Billing",
         "System",
+        "Bookings", // ← added
       ],
       default: "System",
       index: true,
